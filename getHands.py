@@ -1,353 +1,273 @@
 import cv2
 import mediapipe as mp
 import socket
+import json
 import time
-import configparser
-import os
+import platform
 import threading
 from queue import Queue
-from dataclasses import dataclass
-from typing import Optional, Tuple
-import numpy as np
+import uuid
 
-@dataclass
-class Config:
-    """Configurações do sistema"""
-    udp_ip: str = "192.168.0.179"
-    udp_port: int = 5005
-    detection_confidence: float = 0.7
-    tracking_confidence: float = 0.7
-    debounce_time: float = 0.5
-    finger_threshold: float = 0.08
-    min_closed_fingers: int = 4
+class GestureClient:
+    """Cliente que detecta gestos e envia/recebe dados via UDP"""
     
-    @classmethod
-    def from_file(cls, filename='config.ini'):
-        """Carrega configurações de arquivo INI"""
-        config = cls()
-        if os.path.exists(filename):
-            parser = configparser.ConfigParser()
-            parser.read(filename)
-            
-            if 'Network' in parser:
-                config.udp_ip = parser.get('Network', 'ip', fallback=config.udp_ip)
-                config.udp_port = parser.getint('Network', 'port', fallback=config.udp_port)
-            
-            if 'Detection' in parser:
-                config.detection_confidence = parser.getfloat('Detection', 'min_detection', fallback=config.detection_confidence)
-                config.tracking_confidence = parser.getfloat('Detection', 'min_tracking', fallback=config.tracking_confidence)
-                config.debounce_time = parser.getfloat('Detection', 'debounce_time', fallback=config.debounce_time)
-                config.finger_threshold = parser.getfloat('Detection', 'finger_threshold', fallback=config.finger_threshold)
-                config.min_closed_fingers = parser.getint('Detection', 'min_closed_fingers', fallback=config.min_closed_fingers)
-        
-        return config
-
-class NetworkHandler:
-    """Gerencia comunicação UDP"""
-    def __init__(self, ip: str, port: int):
-        self.ip = ip
-        self.port = port
+    def __init__(self, server_ip="192.168.0.105", server_port=5005):
+        # Configuração de rede
+        self.server_ip = server_ip
+        self.server_port = server_port
         self.sock = None
-        self.message_queue = Queue()
-        self.running = False
-        self.thread = None
         
-    def start(self):
-        """Inicia o handler de rede em thread separada"""
+        # Identificação única do cliente
+        self.client_id = f"{platform.node()}_{uuid.uuid4().hex[:8]}"
+        
+        # Fila de respostas recebidas
+        self.response_queue = Queue()
+        self.listening = False
+        
+        # MediaPipe
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+        
+        # Estado do gesto
+        self.prev_state = None
+        self.last_trigger_time = 0
+        self.debounce_time = 0.5
+        
+    def start_network(self):
+        """Inicia comunicação de rede"""
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.running = True
-            self.thread = threading.Thread(target=self._send_loop, daemon=True)
-            self.thread.start()
-            print(f"Socket UDP configurado para {self.ip}:{self.port}")
+            self.sock.settimeout(0.1)  # Non-blocking para receber respostas
+            
+            # Inicia thread para escutar respostas
+            self.listening = True
+            thread = threading.Thread(target=self._listen_responses, daemon=True)
+            thread.start()
+            
+            print(f"Cliente iniciado com ID: {self.client_id}")
+            print(f"Conectando ao servidor: {self.server_ip}:{self.server_port}\n")
+            
+            # Envia ping inicial
+            self.send_ping()
+            
             return True
         except socket.error as e:
-            print(f"Erro ao criar socket: {e}")
+            print(f"Erro ao iniciar rede: {e}")
             return False
     
-    def _send_loop(self):
-        """Loop de envio em thread separada"""
-        while self.running:
+    def _listen_responses(self):
+        """Thread para escutar respostas do servidor"""
+        while self.listening:
             try:
-                if not self.message_queue.empty():
-                    message = self.message_queue.get()
-                    self.sock.sendto(message, (self.ip, self.port))
-                    print(f"Enviado: {message.decode()}")
-                time.sleep(0.01)
-            except socket.error as e:
-                print(f"Erro ao enviar: {e}")
+                data, addr = self.sock.recvfrom(1024)
+                
+                # Tenta decodificar como JSON
+                try:
+                    response = json.loads(data.decode())
+                    self.handle_response(response)
+                except json.JSONDecodeError:
+                    print(f"Resposta não-JSON recebida: {data}")
+                    
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.listening:
+                    print(f"Erro ao receber: {e}")
     
-    def send(self, message: bytes):
-        """Adiciona mensagem à fila de envio"""
-        self.message_queue.put(message)
-    
-    def stop(self):
-        """Para o handler de rede"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1)
-        if self.sock:
-            self.sock.close()
-
-class HandDetector:
-    """Detecta se a mão está aberta ou fechada"""
-    
-    def __init__(self, finger_threshold: float = 0.08, min_closed_fingers: int = 4):
-        self.finger_threshold = finger_threshold
-        self.min_closed_fingers = min_closed_fingers
+    def handle_response(self, response: dict):
+        """Processa respostas do servidor"""
+        msg_type = response.get("type", "UNKNOWN")
+        server_id = response.get("server_id", "unknown")
+        timestamp = response.get("timestamp", 0)
         
-    def is_hand_closed(self, landmarks, handedness: str = "Right") -> bool:
-        """
-        Detecta se a mão está fechada usando distâncias 3D
+        print(f"\n📥 Resposta do servidor [{server_id}]")
+        print(f"   Tipo: {msg_type}")
         
-        Args:
-            landmarks: Landmarks do MediaPipe
-            handedness: "Right" ou "Left"
-        """
+        if msg_type == "DATA_RESPONSE":
+            data = response.get("data")
+            print(f"   ✅ Dados recebidos: {data}")
+            # Aqui você pode processar os dados recebidos
+            # Por exemplo, abrir uma URL, salvar um arquivo, etc.
+            
+        elif msg_type == "NO_DATA":
+            print(f"   ℹ️ {response.get('message', 'Sem dados disponíveis')}")
+            
+        elif msg_type == "ACK_ENVIAR":
+            print(f"   ✅ Servidor pronto para receber")
+            # Aqui você pode enviar os dados reais
+            self.send_data("https://exemplo.com/arquivo.pdf")  # Exemplo
+            
+        elif msg_type == "DATA_RECEIVED":
+            print(f"   ✅ Dados foram recebidos pelo servidor")
+            
+        elif msg_type == "PONG":
+            print(f"   🏓 PONG recebido - Conexão OK")
+        
+        elif msg_type == "MESSAGE":
+            content = response.get("content", "")
+            print(f"   💬 Mensagem: {content}")
+    
+    def send_ping(self):
+        """Envia ping para o servidor"""
+        message = {
+            "type": "PING",
+            "client_id": self.client_id
+        }
+        self.sock.sendto(json.dumps(message).encode(), (self.server_ip, self.server_port))
+    
+    def send_gesture_closed(self):
+        """Envia sinal de mão fechada (dados disponíveis)"""
+        # Versão simples para compatibilidade
+        self.sock.sendto(b"SINAL_ENVIAR", (self.server_ip, self.server_port))
+        print("👊 Gesto FECHAR enviado - Dados disponíveis")
+    
+    def send_gesture_open(self):
+        """Envia sinal de mão aberta (solicitar dados)"""
+        # Versão simples para compatibilidade
+        self.sock.sendto(b"SINAL_RECEBER", (self.server_ip, self.server_port))
+        print("✋ Gesto ABRIR enviado - Solicitando dados")
+    
+    def send_data(self, data: str):
+        """Envia dados para o servidor"""
+        message = {
+            "type": "SEND_DATA",
+            "client_id": self.client_id,
+            "data": data,
+            "timestamp": time.time()
+        }
+        self.sock.sendto(json.dumps(message).encode(), (self.server_ip, self.server_port))
+        print(f"📤 Dados enviados: {data}")
+    
+    def request_data(self):
+        """Solicita dados do servidor (versão JSON)"""
+        message = {
+            "type": "REQUEST_DATA",
+            "client_id": self.client_id
+        }
+        self.sock.sendto(json.dumps(message).encode(), (self.server_ip, self.server_port))
+        print("📥 Solicitando dados...")
+    
+    def is_hand_closed(self, landmarks):
+        """Detecta se a mão está fechada"""
         closed_fingers = 0
         
-        # Dedos: indicador, médio, anelar, mínimo
-        finger_pairs = [
-            (8, 6, 5),   # Indicador: ponta, PIP, MCP
-            (12, 10, 9), # Médio
-            (16, 14, 13),# Anelar
-            (20, 18, 17) # Mínimo
-        ]
-        
-        for tip_id, pip_id, mcp_id in finger_pairs:
-            tip = landmarks[tip_id]
-            pip = landmarks[pip_id]
-            mcp = landmarks[mcp_id]
-            
-            # Calcula distância da ponta até a base do dedo
-            tip_to_mcp_dist = self._calculate_distance_3d(tip, mcp)
-            pip_to_mcp_dist = self._calculate_distance_3d(pip, mcp)
-            
-            # Se a ponta está mais próxima da base que o PIP, o dedo está fechado
-            if tip_to_mcp_dist < pip_to_mcp_dist * 0.9:
+        # Verifica dedos (exceto polegar)
+        for tip_id, pip_id in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+            if landmarks[tip_id].y > landmarks[pip_id].y:
                 closed_fingers += 1
         
-        # Polegar (lógica diferente baseada na lateralidade)
-        thumb_tip = landmarks[4]
-        thumb_ip = landmarks[3]
-        thumb_mcp = landmarks[2]
+        # Polegar
+        if landmarks[4].x < landmarks[3].x:  # Assumindo mão direita
+            closed_fingers += 1
         
-        # Para o polegar, verifica a posição relativa no eixo X
-        if handedness == "Right":
-            if thumb_tip.x < thumb_ip.x:
-                closed_fingers += 1
-        else:  # Left hand
-            if thumb_tip.x > thumb_ip.x:
-                closed_fingers += 1
-        
-        return closed_fingers >= self.min_closed_fingers
+        return closed_fingers >= 4
     
-    def _calculate_distance_3d(self, point1, point2) -> float:
-        """Calcula distância euclidiana 3D entre dois pontos"""
-        return np.sqrt(
-            (point1.x - point2.x) ** 2 +
-            (point1.y - point2.y) ** 2 +
-            (point1.z - point2.z) ** 2
-        )
-
-class GestureDetector:
-    """Detecta transições de gestos com debounce"""
-    
-    def __init__(self, debounce_time: float = 0.5):
-        self.debounce_time = debounce_time
-        self.hand_states = {}  # Rastreia estado de cada mão
-        
-    def detect_transition(self, hand_id: int, current_state: str) -> Optional[str]:
-        """
-        Detecta transições de estado com debounce
-        
-        Returns:
-            "FECHAR", "ABRIR" ou None
-        """
+    def detect_gesture_transition(self, current_state):
+        """Detecta transições de gesto com debounce"""
         current_time = time.time()
-        
-        if hand_id not in self.hand_states:
-            self.hand_states[hand_id] = {
-                'state': current_state,
-                'last_trigger': 0
-            }
-            return None
-        
-        prev_state = self.hand_states[hand_id]['state']
-        last_trigger = self.hand_states[hand_id]['last_trigger']
-        
         transition = None
         
-        if current_time - last_trigger > self.debounce_time:
-            if prev_state == "open" and current_state == "closed":
+        if current_time - self.last_trigger_time > self.debounce_time:
+            if self.prev_state == "open" and current_state == "closed":
                 transition = "FECHAR"
-                self.hand_states[hand_id]['last_trigger'] = current_time
-            elif prev_state == "closed" and current_state == "open":
+                self.last_trigger_time = current_time
+            elif self.prev_state == "closed" and current_state == "open":
                 transition = "ABRIR"
-                self.hand_states[hand_id]['last_trigger'] = current_time
+                self.last_trigger_time = current_time
         
-        self.hand_states[hand_id]['state'] = current_state
+        self.prev_state = current_state
         return transition
-
-class FPSCounter:
-    """Contador de FPS"""
     
-    def __init__(self):
-        self.fps = 0
-        self.frame_count = 0
-        self.start_time = time.time()
+    def run(self):
+        """Loop principal de detecção de gestos"""
+        if not self.start_network():
+            print("Continuando sem rede...")
         
-    def update(self) -> float:
-        """Atualiza e retorna FPS atual"""
-        self.frame_count += 1
-        elapsed = time.time() - self.start_time
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Erro ao abrir câmera")
+            return
         
-        if elapsed > 1.0:
-            self.fps = self.frame_count / elapsed
-            self.frame_count = 0
-            self.start_time = time.time()
+        print("\n=== Detector de Gestos Iniciado ===")
+        print("👊 Fechar mão = Enviar dados")
+        print("✋ Abrir mão = Solicitar dados")
+        print("ESC para sair\n")
         
-        return self.fps
-
-def draw_info(image, fps: float, state: str, hand_count: int):
-    """Desenha informações na imagem"""
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    
-    # Background para texto
-    cv2.rectangle(image, (10, 10), (250, 100), (0, 0, 0), -1)
-    
-    # FPS
-    cv2.putText(image, f"FPS: {fps:.1f}", (20, 35),
-                font, 0.6, (0, 255, 0), 2)
-    
-    # Estado
-    color = (0, 0, 255) if state == "closed" else (0, 255, 0)
-    cv2.putText(image, f"Estado: {state}", (20, 60),
-                font, 0.6, color, 2)
-    
-    # Número de mãos
-    cv2.putText(image, f"Maos: {hand_count}", (20, 85),
-                font, 0.6, (255, 255, 255), 2)
-
-def main():
-    # Carrega configurações
-    config = Config.from_file()
-    print("Configurações carregadas")
-    
-    # Inicializa componentes
-    network = NetworkHandler(config.udp_ip, config.udp_port)
-    if not network.start():
-        print("Falha ao iniciar rede. Continuando sem envio de dados.")
-    
-    hand_detector = HandDetector(
-        finger_threshold=config.finger_threshold,
-        min_closed_fingers=config.min_closed_fingers
-    )
-    
-    gesture_detector = GestureDetector(debounce_time=config.debounce_time)
-    fps_counter = FPSCounter()
-    
-    # Inicializa MediaPipe
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-    
-    # Inicializa câmera
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Erro ao abrir câmera")
-        return
-    
-    # Define resolução para melhor performance
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    print("Sistema iniciado. Pressione ESC para sair.")
-    
-    try:
-        with mp_hands.Hands(
-            min_detection_confidence=config.detection_confidence,
-            min_tracking_confidence=config.tracking_confidence,
-            max_num_hands=2
+        with self.mp_hands.Hands(
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
         ) as hands:
-            
-            current_state = "unknown"
             
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
-                    print("Erro ao capturar frame")
                     break
                 
-                # Flip horizontal para espelho
+                # Processa imagem
                 frame = cv2.flip(frame, 1)
-                
-                # Converte BGR para RGB
                 image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image_rgb.flags.writeable = False
-                
-                # Processa a imagem
                 results = hands.process(image_rgb)
-                
-                # Converte de volta para BGR
-                image_rgb.flags.writeable = True
                 image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
                 
-                hand_count = 0
+                # Adiciona informações na tela
+                cv2.putText(image_bgr, f"Cliente: {self.client_id}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 if results.multi_hand_landmarks:
-                    for idx, (hand_landmarks, handedness) in enumerate(
-                        zip(results.multi_hand_landmarks, results.multi_handedness)
-                    ):
-                        hand_count += 1
-                        
+                    for hand_landmarks in results.multi_hand_landmarks:
                         # Desenha landmarks
-                        mp_drawing.draw_landmarks(
-                            image_bgr, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                            mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2),
-                            mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
+                        self.mp_drawing.draw_landmarks(
+                            image_bgr, hand_landmarks, 
+                            self.mp_hands.HAND_CONNECTIONS
                         )
                         
-                        # Detecta se a mão está fechada
-                        hand_label = handedness.classification[0].label
-                        is_closed = hand_detector.is_hand_closed(
-                            hand_landmarks.landmark, hand_label
-                        )
-                        
+                        # Detecta estado da mão
+                        is_closed = self.is_hand_closed(hand_landmarks.landmark)
                         current_state = "closed" if is_closed else "open"
                         
+                        # Mostra estado
+                        color = (0, 0, 255) if is_closed else (0, 255, 0)
+                        cv2.putText(image_bgr, f"Estado: {current_state}", 
+                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        
                         # Detecta transição
-                        transition = gesture_detector.detect_transition(idx, current_state)
+                        transition = self.detect_gesture_transition(current_state)
                         
                         if transition == "FECHAR":
-                            print(f"[Mão {idx}] Gesto de FECHAR detectado!")
-                            network.send(b"SINAL_ENVIAR")
+                            self.send_gesture_closed()
                         elif transition == "ABRIR":
-                            print(f"[Mão {idx}] Gesto de ABRIR detectado!")
-                            network.send(b"SINAL_RECEBER")
+                            self.send_gesture_open()
                 
-                # Atualiza FPS
-                fps = fps_counter.update()
-                
-                # Desenha informações
-                draw_info(image_bgr, fps, current_state, hand_count)
-                
-                # Mostra a imagem
                 cv2.imshow("Detector de Gestos", image_bgr)
                 
-                # Verifica tecla ESC
-                if cv2.waitKey(5) & 0xFF == 27:
+                if cv2.waitKey(5) & 0xFF == 27:  # ESC
                     break
-    
-    except Exception as e:
-        print(f"Erro durante execução: {e}")
-    
-    finally:
+        
         # Limpeza
-        print("Encerrando sistema...")
-        network.stop()
+        self.stop()
         cap.release()
         cv2.destroyAllWindows()
-        print("Sistema encerrado")
+    
+    def stop(self):
+        """Para o cliente"""
+        self.listening = False
+        if self.sock:
+            self.sock.close()
+        print("\nCliente encerrado")
+
+def main():
+    # Configurações (pode ler de config.ini se preferir)
+    SERVER_IP = "192.168.0.105"  # Ajuste para o IP do servidor
+    SERVER_PORT = 5005
+    
+    # Cria e executa cliente
+    client = GestureClient(server_ip=SERVER_IP, server_port=SERVER_PORT)
+    
+    try:
+        client.run()
+    except KeyboardInterrupt:
+        print("\n\nInterrompido pelo usuário")
+        client.stop()
 
 if __name__ == "__main__":
     main()
