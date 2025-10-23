@@ -1,0 +1,7 @@
+{
+    "device_name": "MyPC",
+    "port": 5000,
+    "upload_dir": "received_files",
+    "camera_index": 0,
+    "show_preview": true
+}
